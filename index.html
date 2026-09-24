@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Algorithmic Mirror</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #000;
+    overflow: hidden; touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage {
+    position: fixed; inset: 0 0 38px 0; display: grid; place-items: center;
+    cursor: pointer;
+  }
+  canvas { display: block; }
+  #hint {
+    position: fixed; left: 50%; bottom: 13px; transform: translateX(-50%);
+    font: 400 10px/1 Inter, system-ui, sans-serif; letter-spacing: .12em;
+    white-space: nowrap; color: rgba(255,255,255,.22);
+    pointer-events: none; user-select: none; text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c"></canvas></div>
+<div id="hint">auto-playing demo &nbsp;·&nbsp; click to restart</div>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   The Algorithmic Mirror — auto-playing demonstration (v2)
+   Logical canvas 1200 × 2000 (1px = 1mm of the portrait screen).
+   No camera, no capture, no stored data.
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   1. CONFIG — every tunable value lives here
+   --------------------------------------------------------------------- */
+const LW = 1200, LH = 2000;
+const CFG = {
+  bg: "#000000",
+
+  // target figure (Cold-Faced Corporate Boss), in units of torso width W
+  W: 270, CX: 600, TORSO_TOP: 660,
+
+  // dashed outline
+  dash: [14, 12], dashW: 2.5, dashA: 0.35,
+
+  // scattered pile
+  pileTop: 1300, ground: 1880, decoys: 48, bars: 4,
+  greyMin: 55, greyMax: 205,
+  pileScale: { head: 0.886, torso: 0.615, lua: 0.677, lfa: 0.677, rua: 0.677, rfa: 0.677, lleg: 0.517, rleg: 0.517 },
+
+  // idle button
+  button: { cx: 600, cy: 1735, w: 460, h: 110, r: 14, breathe: 2400 },
+
+  // materialize: fragments fall in, dashed outline fades in
+  mat: { dropMs: 700, dropDelay: 900, dropFrom: [500, 1000], backC: 0.9, dashIn: [300, 1100] },
+
+  // flight
+  fly: { waveGap: 380, jitter: 140, targetDur: [2600, 3000], decoyDur: [2400, 3000],
+         arcLift: [220, 420], vanishWin: 0.18,
+         liftMs: 500, liftHold: 300, liftH: [60, 120], liftRot: 0.12, liftScale: 0.06 },
+
+  // colour sweep
+  colour: { pause: 500, band: 260 },
+
+  // floor reflection
+  refl: { alpha: 0.12, gap: 20, fade: 350, lineW: 700, lineA: 0.12 },
+
+  // leader-line gutters and descriptor
+  tagEx: { L: 160, R: 1040 },
+  descGap: 60,
+
+  // phase durations (ms)
+  T: { label: 1800, materialize: 1600, morph: 1400, assemble: 6000, colorize: 3000, annotate: 1200,
+       hold: 3000, decay: 4500, collapse: 2800, cooldown: 4600 },
+
+  // scoring
+  capShown: 94,           // displayed total never exceeds this (cap 95 in the rule)
+  collapseBelow: 30,
+  FINAL: { head: 96, chest: 97, abdomen: 96, ua: 93, fa: 91, th: 97, ca: 95 },
+  exprAssemble: 55, exprFinal: 83,
+  // how hard each joint sags during decay (arms fastest, torso slowest)
+  SAG: { head: 0.78, chest: 0.70, abdomen: 0.73, ua: 0.96, fa: 1.00, th: 0.76, ca: 0.77 },
+
+  // colour (figure 4)
+  col: { cyan: "#1FE3D6", blue: "#2A3BFF", magenta: "#D14BFF",
+         torsoTop: "#1E2CFF", torsoBot: "#C552F2", head: "#CBB3F2", headHi: "#EFE7FD" },
+
+  filmGrain: 0.035,
+
+  // machine-vision chrome
+  reticle: { inset: 34, len: 50, alpha: 0.20 },
+  scan: { idlePeriod: 9000, livePeriod: 5200, band: 260, alpha: 0.06, lineA: 0.08,
+          colourBoost: 1.5, glitchMs: 700, glitchAmp: 60 }
+};
+
+const LABELS = [
+  "CONFIDENT MUSCULAR MAN",
+  "COLD-FACED CORPORATE BOSS",
+  "BURNT-OUT OFFICE WORKER",
+  "CHEERFUL SUNSHINE TYPE",
+  "EGOTISTICAL WINNER",
+  "ELEGANT & CHARMING WOMAN",
+  "CURIOUS CHILD"
+];
+const CHOSEN = 1;
+const DESCRIPTOR = "CONFIDENT  \u00b7  HANDS ON HIPS  \u00b7  LEGS APART";
+
+/* ---------------------------------------------------------------------
+   2. CANVAS
+   --------------------------------------------------------------------- */
+const cv = document.getElementById("c");
+let SCALE = 1;                       // logical px → device px, used for shadowBlur
+const ctx = cv.getContext("2d");
+function fit() {
+  const vw = window.innerWidth, vh = Math.max(240, window.innerHeight - 38);
+  const s = Math.min(vw / LW, vh / LH);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(LW * s * dpr);
+  cv.height = Math.round(LH * s * dpr);
+  cv.style.width = (LW * s) + "px";
+  cv.style.height = (LH * s) + "px";
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+  SCALE = s * dpr;
+}
+window.addEventListener("resize", fit);
+
+/* ---------------------------------------------------------------------
+   3. MATH HELPERS
+   --------------------------------------------------------------------- */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+const easeInOut = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const easeOutBack = (t, c1) => { const c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const P = (x, y) => ({ x, y });
+const mir = (p) => P(2 * CFG.CX - p.x, p.y);
+const along = (a, b, t) => P(lerp(a.x, b.x, t), lerp(a.y, b.y, t));
+function wrapAngle(a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
+function bbox(pts) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+  return { x0, y0, x1, y1 };
+}
+
+/* ---------------------------------------------------------------------
+   4. FIGURE GEOMETRY — target (figure 4) and neutral (figure 5)
+   --------------------------------------------------------------------- */
+const W = CFG.W, CX = CFG.CX, TT = CFG.TORSO_TOP;
+const TH = 1.34 * W, TLx = CX - W / 2, TRx = CX + W / 2, TB = TT + TH;
+
+// target
+const tHead = { cx: CX, cy: TT - 0.30 * W, r: 0.27 * W };
+const A = P(TLx, TT), B = P(TLx - 1.07 * W, TT + 0.72 * W), C = P(TLx, TT + 0.78 * W);
+const D = P(TLx - 0.46 * W, TT + 0.79 * W), E = P(TLx, TT + 1.19 * W);
+const L1 = P(TLx, TB + 0.04 * W), L2 = P(TLx + 0.40 * W, TB + 0.21 * W), LF = P(TLx - 0.43 * W, TB + 1.82 * W);
+const TARGET = {
+  torso: [P(TLx, TT), P(TRx, TT), P(TRx, TB), P(TLx, TB)],
+  lua: [A, B, C], lfa: [B, D, E],
+  rua: [mir(A), mir(B), mir(C)], rfa: [mir(B), mir(D), mir(E)],
+  lleg: [L1, L2, LF], rleg: [mir(L1), mir(L2), mir(LF)]
+};
+
+// neutral — same overall height as target, head tops aligned
+const figTop = tHead.cy - tHead.r, figBottom = LF.y;
+const Wn = (figBottom - figTop) / 4.69;
+const nHead = { cx: CX, cy: figTop + 0.36 * Wn, r: 0.36 * Wn };
+const nTT = figTop + 0.90 * Wn, nTB = nTT + 1.61 * Wn, nL = CX - Wn / 2, nR = CX + Wn / 2;
+const armW = 0.33 * Wn, armH = 1.76 * Wn, armGap = 0.13 * Wn;
+const oTL = P(nL - armGap - armW, nTT), iTL = P(nL - armGap, nTT);
+const iBL = P(nL - armGap, nTT + armH), oBL = P(nL - armGap - armW, nTT + armH);
+const legTop = nTB + 0.18 * Wn, legW = 0.48 * Wn, legGap = 0.04 * Wn, apexY = legTop + 2.0 * Wn;
+const lo = P(CX - legGap / 2 - legW, legTop), li = P(CX - legGap / 2, legTop), la = P(CX - legGap / 2 - legW / 2, apexY);
+const NEUTRAL = {
+  torso: [P(nL, nTT), P(nR, nTT), P(nR, nTB), P(nL, nTB)],
+  // each arm rectangle = two triangles split along outer-top → inner-bottom
+  lua: [iTL, oTL, iBL],        // → shoulder, elbow, torso-side
+  lfa: [oTL, oBL, iBL],        // → elbow, inner forearm point, hip
+  rua: [mir(iTL), mir(oTL), mir(iBL)],
+  rfa: [mir(oTL), mir(oBL), mir(iBL)],
+  lleg: [lo, li, la], rleg: [mir(lo), mir(li), mir(la)]
+};
+const FIG_CENTRE = P(CX, (figTop + figBottom) / 2);
+const GROUND_Y = figBottom + CFG.refl.gap;
+const DESC_Y = figBottom + CFG.descGap;
+const TORSO_C = P(CX, TT + TH / 2);
+const POLY_KEYS = ["torso", "lua", "lfa", "rua", "rfa", "lleg", "rleg"];
+const ALL_KEYS = ["head"].concat(POLY_KEYS);
+const SEAM = { lua: 1, lfa: 2, rua: 1, rfa: 2 };     // the diagonal that opens like scissors
+const JOINT_OF = { head: "head", torso: "chest", lua: "ua", lfa: "fa", rua: "ua", rfa: "fa", lleg: "ca", rleg: "th" };
+const WAVE = { lleg: 0, rleg: 0, torso: 1, lua: 2, lfa: 2, rua: 2, rfa: 2, head: 3 };
+
+// local shapes + centres for the eight real pieces
+const PIECE = {};
+PIECE.head = { centre: P(tHead.cx, tHead.cy), shape: { kind: "circle", r: tHead.r } };
+for (const k of POLY_KEYS) {
+  const b = bbox(TARGET[k]);
+  const c = P((b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2);
+  PIECE[k] = { centre: c, shape: { kind: "poly", pts: TARGET[k].map((p) => P(p.x - c.x, p.y - c.y)) } };
+}
+
+// leader-line anchors (world coords on the target figure), mapped to pieces
+const ANCHORS = [
+  { name: "HEAD",    joint: "head",    key: "head",  side: "L", p: P(tHead.cx - tHead.r, tHead.cy) },
+  { name: "U-ARM",   joint: "ua",      key: "lua",   side: "L", p: along(A, B, 0.65) },
+  { name: "F-ARM",   joint: "fa",      key: "lfa",   side: "L", p: along(B, E, 0.45) },
+  { name: "CALF",    joint: "ca",      key: "lleg",  side: "L", p: along(L1, LF, 0.65) },
+  { name: "CHEST",   joint: "chest",   key: "torso", side: "R", p: P(TRx, TT + TH * 0.07) },
+  { name: "ABDOMEN", joint: "abdomen", key: "torso", side: "R", p: P(TRx, TT + TH * 0.95) },
+  { name: "THIGH",   joint: "th",      key: "rleg",  side: "R", p: along(along(mir(L1), mir(L2), 0.5), mir(LF), 0.33) }
+];
+for (const a of ANCHORS) { const c = PIECE[a.key].centre; a.local = P(a.p.x - c.x, a.p.y - c.y); }
+const TAG_EX = CFG.tagEx;
+const JOINTS = ["head", "chest", "abdomen", "ua", "fa", "th", "ca"];
+
+/* ---------------------------------------------------------------------
+   5. SHAPES + GRAIN TEXTURES (pre-rendered once, drawn as images)
+   --------------------------------------------------------------------- */
+function tracePath(g, sh, ox, oy) {
+  g.beginPath();
+  if (sh.kind === "circle") g.arc(ox, oy, sh.r, 0, Math.PI * 2);
+  else if (sh.kind === "ring") { g.arc(ox, oy, sh.r, 0, Math.PI * 2); g.moveTo(ox + sh.ir, oy); g.arc(ox, oy, sh.ir, 0, Math.PI * 2, true); }
+  else { g.moveTo(ox + sh.pts[0].x, oy + sh.pts[0].y); for (let i = 1; i < sh.pts.length; i++) g.lineTo(ox + sh.pts[i].x, oy + sh.pts[i].y); g.closePath(); }
+}
+function shapeBox(sh) {
+  if (sh.kind === "circle" || sh.kind === "ring") return { x0: -sh.r, y0: -sh.r, x1: sh.r, y1: sh.r };
+  return bbox(sh.pts);
+}
+function rotatedBox(sh, rot, sc) {
+  if (sh.kind === "circle" || sh.kind === "ring") { const r = sh.r * sc; return { x0: -r, y0: -r, x1: r, y1: r }; }
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  return bbox(sh.pts.map((p) => P((p.x * cs - p.y * sn) * sc, (p.x * sn + p.y * cs) * sc)));
+}
+function stipple(g, w, h, o) {
+  const img = g.getImageData(0, 0, w, h), d = img.data;
+  const ca = Math.cos(o.ang), sa = Math.sin(o.ang);
+  const pr = [0, w * ca, h * sa, w * ca + h * sa];
+  const pmin = Math.min(...pr), prng = (Math.max(...pr) - pmin) || 1;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (d[i + 3] === 0) continue;
+      const t = ((x * ca + y * sa) - pmin) / prng;
+      const dens = o.dmin + (o.dmax - o.dmin) * Math.pow(t, o.gamma);
+      const r = Math.random();
+      if (r < dens) {
+        const k = o.dark * (0.55 + 0.45 * Math.random());
+        d[i] *= k; d[i + 1] *= k; d[i + 2] *= k;
+      } else if (r < dens + o.light) {
+        d[i] += (255 - d[i]) * 0.3; d[i + 1] += (255 - d[i + 1]) * 0.3; d[i + 2] += (255 - d[i + 2]) * 0.3;
+      }
+    }
+  }
+  g.putImageData(img, 0, 0);
+}
+function makeTex(sh, painter, stip) {
+  const b = shapeBox(sh), pad = 3;
+  const w = Math.max(2, Math.ceil(b.x1 - b.x0 + pad * 2)), h = Math.max(2, Math.ceil(b.y1 - b.y0 + pad * 2));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  const ox = -b.x0 + pad, oy = -b.y0 + pad;
+  tracePath(g, sh, ox, oy);
+  g.fillStyle = painter(g, ox, oy);
+  g.fill(sh.kind === "ring" ? "evenodd" : "nonzero");
+  stipple(g, w, h, stip);
+  return { cv: c, ox: -ox, oy: -oy };
+}
+const greyStip = () => ({ ang: rand(0, Math.PI * 2), dmin: 0.02, dmax: 0.55, gamma: 1.5, dark: 0.35, light: 0.05 });
+const colStip = (ang) => ({ ang: ang, dmin: 0.03, dmax: 0.36, gamma: 1.4, dark: 0.30, light: 0.06 });
+function greyTex(sh) { const v = Math.round(rand(CFG.greyMin, CFG.greyMax)); return makeTex(sh, () => `rgb(${v},${v},${v})`, greyStip()); }
+
+// colour textures for the eight real pieces (built once)
+const COLTEX = {};
+function limbPainter(from, to) {
+  return (g, ox, oy) => {
+    const gr = g.createLinearGradient(ox + from.x, oy + from.y, ox + to.x, oy + to.y);
+    gr.addColorStop(0, CFG.col.cyan); gr.addColorStop(0.5, CFG.col.blue); gr.addColorStop(1, CFG.col.magenta);
+    return gr;
+  };
+}
+function buildColourTextures() {
+  const loc = (k, p) => P(p.x - PIECE[k].centre.x, p.y - PIECE[k].centre.y);
+  COLTEX.head = makeTex(PIECE.head.shape, (g, ox, oy) => {
+    const r = tHead.r, gr = g.createRadialGradient(ox - r * 0.3, oy - r * 0.35, r * 0.1, ox, oy, r * 1.05);
+    gr.addColorStop(0, CFG.col.headHi); gr.addColorStop(1, CFG.col.head); return gr;
+  }, colStip(Math.PI * 0.25));
+  COLTEX.torso = makeTex(PIECE.torso.shape, (g, ox, oy) => {
+    const gr = g.createLinearGradient(ox, oy - TH / 2, ox, oy + TH / 2);
+    gr.addColorStop(0, CFG.col.torsoTop); gr.addColorStop(1, CFG.col.torsoBot); return gr;
+  }, colStip(Math.PI / 2));
+  const defs = {
+    lua: [along(A, C, 0.5), B], lfa: [E, B],
+    rua: [along(mir(A), mir(C), 0.5), mir(B)], rfa: [mir(E), mir(B)],
+    lleg: [along(L1, L2, 0.5), LF], rleg: [along(mir(L1), mir(L2), 0.5), mir(LF)]
+  };
+  for (const k in defs) {
+    const f = loc(k, defs[k][0]), t = loc(k, defs[k][1]);
+    COLTEX[k] = makeTex(PIECE[k].shape, limbPainter(f, t), colStip(Math.atan2(t.y - f.y, t.x - f.x)));
+  }
+}
+
+// decoy vocabulary (figure 3)
+function polyFrom(pts) { const b = bbox(pts), cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2; return { kind: "poly", pts: pts.map((p) => P(p.x - cx, p.y - cy)) }; }
+function arcPts(R, a0, a1, n, withCentre) {
+  const pts = withCentre ? [P(0, 0)] : [];
+  for (let i = 0; i <= n; i++) { const a = lerp(a0, a1, i / n); pts.push(P(R * Math.cos(a), -R * Math.sin(a))); }
+  return pts;
+}
+function randomDecoy() {
+  const t = Math.random(), s = rand(44, 150);
+  if (t < 0.15) return { kind: "circle", r: s * 0.5 };
+  if (t < 0.25) return polyFrom(arcPts(s * 0.6, 0, Math.PI, 28, false));
+  if (t < 0.33) return polyFrom(arcPts(s * 0.75, 0, Math.PI / 2, 18, true));
+  if (t < 0.41) { const r = s * 0.5; return { kind: "ring", r: r, ir: r * rand(0.42, 0.62) }; }
+  if (t < 0.66) {
+    const v = Math.random();
+    if (v < 0.3) return polyFrom([P(0, -s * 0.58), P(s * 0.5, s * 0.29), P(-s * 0.5, s * 0.29)]);
+    if (v < 0.6) return polyFrom([P(0, 0), P(s, 0), P(0, -s * rand(0.6, 1.2))]);
+    if (v < 0.85) return polyFrom([P(0, -s * rand(1.2, 1.9)), P(s * 0.28, 0), P(-s * 0.28, 0)]);
+    return polyFrom([P(rand(-s, 0), rand(-s, 0)), P(rand(0, s), rand(-s * 0.3, s * 0.3)), P(rand(-s * 0.5, s * 0.5), rand(0, s))]);
+  }
+  if (t < 0.80) return polyFrom([P(0, 0), P(s, 0), P(s, s), P(0, s)]);
+  const w = s * rand(1.1, 2.0), h = s * rand(0.4, 0.8);
+  return polyFrom([P(0, 0), P(w, 0), P(w, h), P(0, h)]);
+}
+function barShape() { const l = rand(260, 380), th = rand(12, 16); return polyFrom([P(0, 0), P(l, 0), P(l, th), P(0, th)]); }
+
+/* ---------------------------------------------------------------------
+   6. PILE — static stacked layout, rebuilt each time we return to idle
+   --------------------------------------------------------------------- */
+let pile = [];
+const REAL = {};           // key → pile item for the eight real pieces
+function generatePile() {
+  pile = [];
+  const items = [];
+  for (const k of ALL_KEYS) items.push({ isTarget: true, key: k, shape: PIECE[k].shape, scale: CFG.pileScale[k] });
+  for (let i = 0; i < CFG.decoys; i++) items.push({ isTarget: false, shape: randomDecoy(), scale: 1 });
+  for (let i = items.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [items[i], items[j]] = [items[j], items[i]]; }
+  for (let i = 0; i < CFG.bars; i++) items.push({ isTarget: false, shape: barShape(), scale: 1, bar: true });
+
+  const X0 = 60, X1 = 1140, STEP = 8, NC = Math.ceil((X1 - X0) / STEP);
+  const top = new Array(NC).fill(CFG.ground);
+  const colOf = (x) => clamp(Math.floor((x - X0) / STEP), 0, NC - 1);
+
+  for (const it of items) {
+    let rot;
+    if (it.bar) rot = (Math.random() < 0.5 ? -1 : 1) * rand(0.25, 0.55);
+    else if (it.isTarget && (it.key === "lleg" || it.key === "rleg")) rot = (Math.random() < 0.5 ? -1 : 1) * rand(1.0, 1.4);
+    else rot = Math.random() < 0.25 ? 0 : rand(-0.6, 0.6);
+
+    let placed = null;
+    for (let attempt = 0; attempt < 2 && !placed; attempt++) {
+      const rb = rotatedBox(it.shape, rot, it.scale);
+      const bw = rb.x1 - rb.x0, bh = rb.y1 - rb.y0;
+      let best = null;
+      for (let tr = 0; tr < 12; tr++) {
+        const x = rand(X0 - rb.x0, X1 - rb.x1);
+        let surf = CFG.ground;
+        for (let c = colOf(x + rb.x0); c <= colOf(x + rb.x1); c++) surf = Math.min(surf, top[c]);
+        const sink = bh * rand(0.05, 0.3);
+        const cy = surf + sink - rb.y1;
+        const tp = cy + rb.y0;
+        if (!best || tp > best.tp) best = { x: x, cy: cy, tp: tp, rb: rb, bh: bh };
+        if (tp >= CFG.pileTop) break;
+      }
+      if (best.tp >= CFG.pileTop) placed = best;
+      else if (it.isTarget) { best.cy += CFG.pileTop - best.tp; best.tp = CFG.pileTop; placed = best; }
+      else it.scale *= 0.72;
+    }
+    if (!placed) continue;
+    for (let c = colOf(placed.x + placed.rb.x0); c <= colOf(placed.x + placed.rb.x1); c++)
+      top[c] = Math.min(top[c], placed.tp + placed.bh * 0.25);
+
+    it.pile = { x: placed.x, y: placed.cy, rot: wrapAngle(rot), scale: it.scale };
+    it.texG = greyTex(it.shape);
+    it.texC = it.isTarget ? COLTEX[it.key] : null;
+    it.fph = rand(0, Math.PI * 2); it.famp = rand(1, 3); it.ffreq = rand(0.6, 1.3);
+    pile.push(it);
+    if (it.isTarget) REAL[it.key] = it;
+  }
+}
+function floatY(it, now) { return Math.sin(now / 1000 * it.ffreq * Math.PI + it.fph) * it.famp; }
+
+/* ---------------------------------------------------------------------
+   7. DRAWING PRIMITIVES
+   --------------------------------------------------------------------- */
+function drawItem(it, pose, colourAmt) {
+  if (pose.a <= 0.004 || pose.sc <= 0.002) return;
+  ctx.save();
+  ctx.translate(pose.x, pose.y); ctx.rotate(pose.rot); ctx.scale(pose.sc, pose.sc);
+  const c = it.texC ? clamp(colourAmt, 0, 1) : 0;
+  if (c < 1) { ctx.globalAlpha = pose.a; ctx.drawImage(it.texG.cv, it.texG.ox, it.texG.oy); }
+  if (c > 0) { ctx.globalAlpha = pose.a * c; ctx.drawImage(it.texC.cv, it.texC.ox, it.texC.oy); }
+  ctx.restore();
+}
+function toWorld(local, pose) {
+  const cs = Math.cos(pose.rot), sn = Math.sin(pose.rot);
+  return P(pose.x + (local.x * cs - local.y * sn) * pose.sc, pose.y + (local.x * sn + local.y * cs) * pose.sc);
+}
+// thin white outline of a piece — marks the moment the system selects it
+function strokeShape(it, pose, a) {
+  if (a <= 0.004) return;
+  ctx.save();
+  ctx.translate(pose.x, pose.y); ctx.rotate(pose.rot); ctx.scale(pose.sc, pose.sc);
+  tracePath(ctx, it.shape, 0, 0);
+  ctx.setLineDash([]); ctx.lineWidth = 2.2 / pose.sc;
+  ctx.strokeStyle = "rgba(255,255,255," + a + ")"; ctx.stroke();
+  ctx.restore();
+}
+// floor reflection: mirror the eight pieces about the ground line, then fade to black
+function drawReflection(poses, colourOf, amt) {
+  if (amt <= 0.004) return;
+  const G = GROUND_Y, R = CFG.refl;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, G, LW, LH - G); ctx.clip();
+  ctx.translate(0, 2 * G); ctx.scale(1, -1);
+  for (const k of ALL_KEYS) {
+    const p = poses[k]; if (!p) continue;
+    drawItem(REAL[k], { x: p.x, y: p.y, rot: p.rot, sc: p.sc, a: p.a * R.alpha * amt }, colourOf(k));
+  }
+  ctx.restore();
+  const gr = ctx.createLinearGradient(0, G, 0, G + R.fade);
+  gr.addColorStop(0, "rgba(0,0,0,0)"); gr.addColorStop(1, "rgba(0,0,0,1)");
+  ctx.fillStyle = gr; ctx.fillRect(0, G, LW, R.fade);
+  ctx.fillStyle = CFG.bg; ctx.fillRect(0, G + R.fade, LW, LH - G - R.fade);
+  rect(CX - R.lineW / 2, G, R.lineW, 1.5, R.lineA * amt);
+}
+function drawButton(now) {
+  const b = CFG.button;
+  const breathe = 0.65 + 0.20 * Math.sin(now / b.breathe * Math.PI * 2);
+  ctx.save();
+  roundRectPath(b.cx - b.w / 2, b.cy - b.h / 2, b.w, b.h, b.r);
+  ctx.setLineDash([]); ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255," + breathe + ")"; ctx.stroke();
+  ctx.restore();
+  text("TOUCH TO BEGIN", b.cx, b.cy + 12, 34, { align: "center", a: 0.9, w: 500, ls: 2, glow: 0.18 * breathe, glowR: 16 });
+}
+
+// dashed outline, interpolated neutral (t=0) → target (t=1)
+function drawOutlines(t, seamA, alphaOf) {
+  ctx.save();
+  ctx.lineWidth = CFG.dashW; ctx.setLineDash(CFG.dash); ctx.lineCap = "butt";
+  const ha = alphaOf("head");
+  if (ha > 0.004) {
+    ctx.strokeStyle = `rgba(255,255,255,${ha})`;
+    ctx.beginPath();
+    ctx.arc(lerp(nHead.cx, tHead.cx, t), lerp(nHead.cy, tHead.cy, t), lerp(nHead.r, tHead.r, t), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  for (const k of POLY_KEYS) {
+    const a = alphaOf(k); if (a <= 0.004) continue;
+    const n = NEUTRAL[k], g = TARGET[k];
+    const pts = n.map((p, i) => P(lerp(p.x, g[i].x, t), lerp(p.y, g[i].y, t)));
+    for (let e = 0; e < pts.length; e++) {
+      const ea = (SEAM[k] === e) ? a * seamA : a;
+      if (ea <= 0.004) continue;
+      const p0 = pts[e], p1 = pts[(e + 1) % pts.length];
+      ctx.strokeStyle = `rgba(255,255,255,${ea})`;
+      ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+/* type */
+const FONT = "Inter, system-ui, -apple-system, 'Segoe UI', sans-serif";
+function setFont(size, weight) { ctx.font = (weight || 400) + " " + size + "px " + FONT; }
+function text(str, x, y, size, o) {
+  o = o || {};
+  setFont(size, o.w);
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255," + (o.a === undefined ? 1 : o.a) + ")";
+  ctx.textBaseline = "alphabetic";
+  if (o.glow) { ctx.shadowColor = "rgba(255,255,255," + o.glow + ")"; ctx.shadowBlur = (o.glowR || 20) * SCALE; }
+  if (o.ls) {
+    const chars = str.split(""), widths = chars.map((c) => ctx.measureText(c).width);
+    const total = widths.reduce((a, b) => a + b, 0) + o.ls * (chars.length - 1);
+    let cx = o.align === "center" ? x - total / 2 : (o.align === "right" ? x - total : x);
+    ctx.textAlign = "left";
+    for (let i = 0; i < chars.length; i++) { ctx.fillText(chars[i], cx, y); cx += widths[i] + o.ls; }
+  } else { ctx.textAlign = o.align || "left"; ctx.fillText(str, x, y); }
+  ctx.restore();
+  ctx.textAlign = "left";
+}
+function fitSize(str, size, maxW, weight) { setFont(size, weight); const w = ctx.measureText(str).width; return w > maxW ? size * maxW / w : size; }
+function rect(x, y, w, h, a) { ctx.fillStyle = "rgba(255,255,255," + a + ")"; ctx.fillRect(x, y, w, h); }
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+}
+
+/* ---------------------------------------------------------------------
+   8. HUD — face box, total compliance, joint leader lines (kept)
+   --------------------------------------------------------------------- */
+const FB = { x: 880, y: 200, w: 240, h: 260 };
+function faceBox(mode, expression, dim) {
+  const d = dim === undefined ? 1 : dim;
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255," + 0.32 * d + ")"; ctx.lineWidth = 2;
+  ctx.setLineDash(mode === "empty" ? [10, 9] : []);
+  ctx.strokeRect(FB.x, FB.y, FB.w, FB.h); ctx.setLineDash([]);
+  ctx.restore();
+  const b = 24, t = 3, a = 0.78 * d;
+  [[FB.x, FB.y, 1, 1], [FB.x + FB.w, FB.y, -1, 1], [FB.x, FB.y + FB.h, 1, -1], [FB.x + FB.w, FB.y + FB.h, -1, -1]].forEach((c) => {
+    rect(Math.min(c[0], c[0] + b * c[2]), c[1] - (c[3] > 0 ? 0 : t), b, t, a);
+    rect(c[0] - (c[2] > 0 ? 0 : t), Math.min(c[1], c[1] + b * c[3]), t, b, a);
+  });
+  text("FACE", FB.x + FB.w / 2, 182, 16, { align: "center", a: 0.42 * d, ls: 4 });
+  if (mode === "empty") {
+    rect(FB.x + 18, FB.y + FB.h / 2, FB.w - 36, 1.5, 0.3 * d);
+    text("NO SUBJECT DETECTED", FB.x + FB.w / 2, FB.y + FB.h + 38, 15, { align: "center", a: 0.32, ls: 2 });
+    return;
+  }
+  ctx.save();
+  if (mode === "blur") ctx.filter = "blur(9px)";
+  const iw = FB.w - 30, ih = FB.h - 30, ox = FB.x + 15, oy = FB.y + 15;
+  const hw = iw * 0.72, hx = ox + (iw - hw) / 2, hy = oy + (ih - hw * 0.94) / 2;
+  roundRectPath(hx, hy, hw, hw * 0.94, hw * 0.20);
+  ctx.fillStyle = "rgba(255,255,255," + 0.95 * d + ")"; ctx.fill();
+  const ey = hy + hw * 0.34, ew = hw * 0.135;
+  ctx.fillStyle = CFG.bg;
+  roundRectPath(hx + hw * 0.22, ey, ew, ew * 0.74, ew * 0.3); ctx.fill();
+  roundRectPath(hx + hw * 0.645, ey, ew, ew * 0.74, ew * 0.3); ctx.fill();
+  const mw = hw * 0.38, mh = hw * 0.078, mx = hx + (hw - mw) / 2, my = hy + hw * 0.63;
+  const tilt = mode === "blur" ? -6 : ((expression === null ? 60 : expression) - 60) * 0.10;
+  ctx.save(); ctx.translate(mx + mw / 2, my + mh / 2); ctx.rotate(tilt * Math.PI / 180);
+  roundRectPath(-mw / 2, -mh / 2, mw, mh, mh / 2); ctx.fillStyle = CFG.bg; ctx.fill(); ctx.restore();
+  ctx.restore();
+  text("EXPRESSION", FB.x + FB.w / 2, 490, 15, { align: "center", a: 0.4 * d, ls: 2 });
+  const val = (mode === "blur" || expression === null) ? "\u2014\u2014" : Math.round(expression) + "%";
+  text(val, FB.x + FB.w / 2, 526, 32, { align: "center", a: 0.95 * d, w: 500 });
+}
+function totalBlock(total, sub, dim) {
+  const d = dim === undefined ? 1 : dim;
+  text(Math.round(total) + "%", 600, 322, 130, { align: "center", w: 500, a: d, glow: 0.30 * d * colourFromTotal(total), glowR: 26 });
+  text("TOTAL COMPLIANCE", 600, 374, 22, { align: "center", a: 0.5 * d, ls: 2 });
+  text(sub, 600, 405, 17, { align: "center", a: 0.3 * d, ls: 1 });
+  const X = 300, Y = 452, L = 600, H = 6;
+  rect(X, Y, L, H, 0.16 * d);
+  rect(X, Y, L * clamp(total, 0, 100) / 100, H, 0.92 * d);
+  rect(X + L * 0.30, Y - 7, 1.5, H + 14, 0.35 * d);
+  rect(X + L * 0.95, Y - 7, 1.5, H + 14, 0.45 * d);
+}
+function tag(side, ax, ay, ex, label, val, alpha) {
+  const a = alpha === undefined ? 1 : alpha;
+  if (a <= 0.004) return;
+  rect(Math.min(ax, ex), ay, Math.abs(ex - ax), 1.5, 0.32 * a);
+  ctx.beginPath(); ctx.arc(ax, ay + 0.75, 3, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255," + 0.65 * a + ")"; ctx.fill();
+  if (side === "L") {
+    text(label, ex - 10, ay - 26, 15, { align: "right", a: 0.4 * a, ls: 2 });
+    text(Math.round(val) + "%", ex - 10, ay + 2, 32, { align: "right", a: 0.95 * a, w: 500 });
+  } else {
+    text(label, ex + 14, ay - 26, 15, { align: "left", a: 0.4 * a, ls: 2 });
+    text(Math.round(val) + "%", ex + 14, ay + 2, 32, { align: "left", a: 0.95 * a, w: 500 });
+  }
+}
+function drawTags(poses, vals, alpha, alphaOf) {
+  for (const an of ANCHORS) {
+    const pose = poses[an.key]; if (!pose) continue;
+    const w = toWorld(an.local, pose);
+    const k = alphaOf ? alphaOf(an.key) : 1;
+    tag(an.side, w.x, w.y, TAG_EX[an.side], an.name, vals[an.joint], alpha * k * clamp(pose.a, 0, 1));
+  }
+}
+function stateLabel(s) { text(s, 60, 88, 26, { a: 0.35, ls: 4 }); }
+function labelTitle(a) { const sz = fitSize(LABELS[CHOSEN], 30, 760, 500); text(LABELS[CHOSEN], 600, 156, sz, { align: "center", w: 500, a: a }); }
+
+/* ---------------------------------------------------------------------
+   9. PARTICLES
+   --------------------------------------------------------------------- */
+const PARTS = [];
+function burst(x, y, n, spread, vmin, vmax, life, smin, smax, alpha, from) {
+  for (let i = 0; i < n; i++) {
+    const px = x + rand(-spread, spread), py = y + rand(-spread, spread);
+    const o = from || P(x, y);
+    const base = (px === o.x && py === o.y) ? rand(0, Math.PI * 2) : Math.atan2(py - o.y, px - o.x);
+    const ang = base + rand(-1.1, 1.1), sp = rand(vmin, vmax);
+    PARTS.push({ x: px, y: py, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 60,
+      s: rand(smin, smax), ratio: rand(0.5, 1.1), r: rand(0, Math.PI), vr: rand(-3.4, 3.4),
+      a: alpha * rand(0.45, 1), life: 0, max: life * rand(0.8, 1.2) });
+  }
+}
+function updateParticles(dt) {
+  for (const p of PARTS) {
+    p.life += dt; p.vy += 200 * dt; p.vx *= (1 - 1.15 * dt); p.vy *= (1 - 0.45 * dt);
+    p.x += p.vx * dt; p.y += p.vy * dt; p.r += p.vr * dt;
+  }
+  for (let i = PARTS.length - 1; i >= 0; i--) if (PARTS[i].life > PARTS[i].max) PARTS.splice(i, 1);
+}
+function drawParticles(fade) {
+  for (const p of PARTS) {
+    const a = p.a * Math.max(0, 1 - p.life / p.max) * fade;
+    if (a <= 0.012) continue;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.r);
+    ctx.fillStyle = "rgba(255,255,255," + a + ")";
+    ctx.fillRect(-p.s / 2, -p.s * p.ratio / 2, p.s, p.s * p.ratio);
+    ctx.restore();
+  }
+}
+
+/* machine-vision chrome: viewfinder corners + a scanline whose behaviour reports
+   the system's state (slow while waiting, reading while live, paints the colour,
+   glitches at collapse, freezes when locked). Monochrome; never alters the figure. */
+let scanY = -CFG.scan.band, scanForce = null, scanFrom = 0;
+function drawScanBand(cy, a, lineAtCentre) {
+  const S = CFG.scan, band = S.band;
+  const g = ctx.createLinearGradient(0, cy - band / 2, 0, cy + band / 2);
+  g.addColorStop(0, "rgba(255,255,255,0)");
+  g.addColorStop(0.5, "rgba(255,255,255," + S.alpha * a + ")");
+  g.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, cy - band / 2, LW, band);
+  ctx.fillStyle = "rgba(255,255,255," + S.lineA * a + ")";
+  ctx.fillRect(0, lineAtCentre ? cy - 0.6 : cy + band / 2 - 1, LW, 1.2);
+}
+function drawChrome(y, glitchK, painting) {
+  const R = CFG.reticle, S = CFG.scan;
+  ctx.save();
+  ctx.setLineDash([]); ctx.lineCap = "butt"; ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(255,255,255," + R.alpha + ")";
+  const i = R.inset, l = R.len;
+  for (const c of [[i, i, 1, 1], [LW - i, i, -1, 1], [i, LH - i, 1, -1], [LW - i, LH - i, -1, -1]]) {
+    ctx.beginPath();
+    ctx.moveTo(c[0] + l * c[2], c[1]); ctx.lineTo(c[0], c[1]); ctx.lineTo(c[0], c[1] + l * c[3]);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.save();
+  if (glitchK > 0) {
+    drawScanBand(y + rand(-S.glitchAmp, S.glitchAmp) * glitchK, 1, false);
+    drawScanBand(y + rand(-S.glitchAmp * 2.4, S.glitchAmp * 2.4) * glitchK, 0.7 * glitchK, false);
+  } else {
+    drawScanBand(y, painting ? S.colourBoost : 1, painting);
+  }
+  ctx.restore();
+}
+
+/* film grain overlay */
+const GRAIN = [];
+function buildGrain() {
+  for (let k = 0; k < 3; k++) {
+    const c = document.createElement("canvas"); c.width = c.height = 256;
+    const g = c.getContext("2d"), img = g.createImageData(256, 256), d = img.data;
+    for (let i = 0; i < d.length; i += 4) { const v = (Math.random() * 255) | 0; d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255; }
+    g.putImageData(img, 0, 0);
+    GRAIN.push(ctx.createPattern(c, "repeat"));
+  }
+}
+
+/* ---------------------------------------------------------------------
+   10. SEQUENCE STATE
+   --------------------------------------------------------------------- */
+const ORDER = ["idle", "label", "materialize", "morph", "assemble", "colorize", "annotate", "hold", "decay", "collapse", "cooldown"];
+let phase = "idle", t0 = performance.now(), attempts = 2148, frame = 0;
+let decayEnd = null;           // snapshot when collapse begins
+
+function setPhase(p, now) {
+  const prev = phase;
+  phase = p; t0 = now;
+  if (p === "idle") { if (prev === "cooldown") attempts += 1; PARTS.length = 0; pile = []; }
+  if (p === "label") { generatePile(); setupDrops(); }      // built during the spin, revealed after it
+  if (p === "assemble") setupFlights(now);
+  if (p === "decay") setupDecay();
+  if (p === "collapse") setupCollapse();
+  if (p === "colorize") scanFrom = scanY;
+}
+function nextPhase(now) { setPhase(ORDER[(ORDER.indexOf(phase) + 1) % ORDER.length], now); }
+
+function setupDrops() {
+  const M = CFG.mat;
+  for (const it of pile) it.drop = { delay: rand(0, M.dropDelay), from: it.pile.y - rand(M.dropFrom[0], M.dropFrom[1]), spin: rand(-0.6, 0.6) };
+}
+function dropPose(it, el) {
+  const M = CFG.mat, d = it.drop, k = clamp((el - d.delay) / M.dropMs, 0, 1);
+  return { x: it.pile.x, y: lerp(d.from, it.pile.y, easeOutBack(k, M.backC)), rot: it.pile.rot + (1 - k) * d.spin,
+           sc: it.pile.scale, a: clamp(k / 0.25, 0, 1) };
+}
+function setupFlights(now) {
+  for (const it of pile) {
+    const sx = it.pile.x, sy = it.pile.y + floatY(it, now);
+    const Fy = CFG.fly, pre = Fy.liftMs + Fy.liftHold;
+    if (it.isTarget) {
+      const c = PIECE[it.key].centre;
+      const lh = rand(Fy.liftH[0], Fy.liftH[1]), lr = rand(-Fy.liftRot, Fy.liftRot);
+      const ly = sy - lh;
+      it.fl = { lift: { h: lh, rot: lr }, pre: pre,
+                delay: pre + WAVE[it.key] * Fy.waveGap + rand(0, Fy.jitter), dur: rand(Fy.targetDur[0], Fy.targetDur[1]),
+                sx: sx, sy: ly, px: sx, py: sy, srot: it.pile.rot + lr, sscale: it.pile.scale * (1 + Fy.liftScale),
+                ex: c.x, ey: c.y, erot: 0, escale: 1 };
+    } else if (Math.random() < 0.7) {
+      it.fl = { delay: pre + ((Math.random() * 4) | 0) * Fy.waveGap + rand(0, 120), dur: rand(Fy.decoyDur[0], Fy.decoyDur[1]),
+                sx: sx, sy: sy, srot: it.pile.rot, sscale: it.pile.scale,
+                ex: rand(300, 900), ey: rand(580, 1400), erot: it.pile.rot + rand(-1.5, 1.5), escale: it.pile.scale * 0.9,
+                vanishU: rand(0.3, 0.7), burst: false };
+    } else {
+      it.fl = { fadeOnly: true, fadeDelay: pre + rand(0, 1400), sx: sx, sy: sy };
+    }
+    if (!it.fl.fadeOnly) {
+      it.fl.cx = (it.fl.sx + it.fl.ex) / 2 + rand(-120, 120);
+      it.fl.cy = Math.min(it.fl.sy, it.fl.ey) - rand(Fy.arcLift[0], Fy.arcLift[1]);
+    }
+  }
+}
+function flightPose(it, el) {
+  const f = it.fl;
+  if (f.fadeOnly) return { x: f.sx, y: f.sy, rot: it.pile.rot, sc: it.pile.scale, a: 1 - clamp((el - f.fadeDelay) / 600, 0, 1), u: 0, sel: 0 };
+  // selection lift: the eight real pieces rise out of the pile before anything flies
+  if (it.isTarget && el < f.delay) {
+    const k = easeOut(clamp(el / CFG.fly.liftMs, 0, 1));
+    return { x: f.px, y: lerp(f.py, f.sy, k), rot: lerp(it.pile.rot, f.srot, k), sc: lerp(it.pile.scale, f.sscale, k),
+             a: 1, u: 0, sel: k };
+  }
+  const u = clamp((el - f.delay) / f.dur, 0, 1);
+  if (u <= 0) return { x: f.sx, y: f.sy, rot: f.srot, sc: f.sscale, a: 1, u: 0, sel: it.isTarget ? 1 : 0 };
+  const e = easeInOut(u), q = 1 - e;
+  const x = q * q * f.sx + 2 * q * e * f.cx + e * e * f.ex;
+  const y = q * q * f.sy + 2 * q * e * f.cy + e * e * f.ey;
+  let sc = lerp(f.sscale, f.escale, e), rot = lerp(f.srot, f.erot, e), a = 1, sel = 0;
+  if (it.isTarget) {
+    const bump = u > 0.82 ? Math.sin(Math.PI * (u - 0.82) / 0.18) : 0; sc *= 1 + 0.03 * bump;
+    sel = 1 - clamp(u / 0.3, 0, 1);
+  } else {
+    const k = clamp((u - f.vanishU) / CFG.fly.vanishWin, 0, 1);
+    if (k > 0 && !f.burst) { f.burst = true; burst(x, y, 8 + ((Math.random() * 8) | 0), 14, 40, 170, 1.3, 2, 7, 0.75); }
+    sc *= (1 - k); a = 1 - k;
+  }
+  return { x, y, rot, sc, a, u, sel };
+}
+function setupDecay() {
+  for (const k of ALL_KEYS) {
+    const it = REAL[k], c = PIECE[k].centre;
+    let dx = c.x - CX, dy = c.y - 900; const len = Math.hypot(dx, dy) || 1;
+    const ang = Math.atan2(dy / len, dx / len) + rand(-0.5, 0.5);
+    it.dec = { dx: Math.cos(ang), dy: Math.sin(ang), max: rand(40, 80), rot: rand(-0.22, 0.22) };
+  }
+}
+function decayPose(k, drop) {
+  const it = REAL[k], c = PIECE[k].centre, d = it.dec;
+  return { x: c.x + d.dx * d.max * drop, y: c.y + d.dy * d.max * drop, rot: d.rot * drop, sc: 1, a: 1 };
+}
+function setupCollapse() {
+  const start = decayEnd || {};
+  let totalArea = 0; const areas = {};
+  for (const k of ALL_KEYS) { const b = shapeBox(PIECE[k].shape); areas[k] = (b.x1 - b.x0) * (b.y1 - b.y0); totalArea += areas[k]; }
+  for (const k of ALL_KEYS) {
+    const it = REAL[k], s = start[k] || { x: PIECE[k].centre.x, y: PIECE[k].centre.y, rot: 0, sc: 1, a: 1 };
+    let dx = s.x - CX, dy = s.y - 900; const len = Math.hypot(dx, dy) || 1;
+    const ang = Math.atan2(dy / len, dx / len) + rand(-0.5, 0.5), dist = rand(200, 340);
+    const bb = shapeBox(PIECE[k].shape), hd = Math.hypot(bb.x1 - bb.x0, bb.y1 - bb.y0) / 2;
+    it.col = { sx: s.x, sy: s.y, srot: s.rot,
+      ex: clamp(s.x + Math.cos(ang) * dist, hd + 20, LW - hd - 20),
+      ey: clamp(s.y + Math.sin(ang) * dist, 520 + hd, 1660 - hd * 0.5),
+      spin: (Math.random() < 0.5 ? -1 : 1) * rand(0.6, 2.0) };
+    const b = shapeBox(PIECE[k].shape);
+    burst(s.x, s.y, Math.round(190 * areas[k] / totalArea), Math.min(b.x1 - b.x0, b.y1 - b.y0) * 0.45,
+          70, 370, 3.4, 2.5, 12, 0.8, P(CX, 900));
+  }
+}
+function collapsePose(k, e) {
+  const c = REAL[k].col;
+  return { x: lerp(c.sx, c.ex, e), y: lerp(c.sy, c.ey, e), rot: c.srot + c.spin * e, sc: 1, a: lerp(1, 0.4, e) };
+}
+
+function scoreOf(vals, expr) {
+  let m = 0; for (const j of JOINTS) m += vals[j]; m /= JOINTS.length;
+  return Math.min(CFG.capShown, 0.7 * m + 0.3 * (expr || 0));
+}
+function colourFromTotal(total) { return clamp((total - CFG.collapseBelow) / (91 - CFG.collapseBelow), 0, 1); }
+const SUB_LIVE = "MOTION 70  \u00b7  EXPRESSION 30  \u00b7  CAP 95";
+
+/* ---------------------------------------------------------------------
+   11. FRAME
+   --------------------------------------------------------------------- */
+let lastNow = performance.now();
+function hudLabelTitle(a) { labelTitle(a); }
+function stillPoses() { const o = {}; for (const k of ALL_KEYS) o[k] = { x: PIECE[k].centre.x, y: PIECE[k].centre.y, rot: 0, sc: 1, a: 1 }; return o; }
+
+function draw(now) {
+  const el = now - t0, dt = Math.min(0.05, Math.max(0, (now - lastNow) / 1000));
+  lastNow = now; frame++;
+  if (PARTS.length) updateParticles(dt);
+  ctx.fillStyle = CFG.bg; ctx.fillRect(0, 0, LW, LH);
+  const dur = CFG.T[phase], u = dur ? clamp(el / dur, 0, 1) : 0;
+
+  if (phase === "idle") {
+    // ---- 01 IDLE: nothing but the entry button (as version 1) ----
+    stateLabel("STATE 01 / IDLE");
+    faceBox("empty");
+    drawButton(now);
+    rect(300, 1830, 600, 1, 0.14);
+    text(attempts.toLocaleString("en-US"), 300, 1900, 44, { align: "center", a: 0.7, w: 500 });
+    text("ATTEMPTS", 300, 1932, 15, { align: "center", a: 0.35, ls: 3 });
+    text("0", 900, 1900, 44, { align: "center", a: 0.7, w: 500 });
+    text("COMPLETED", 900, 1932, 15, { align: "center", a: 0.35, ls: 3 });
+    rect(599, 1852, 1.5, 78, 0.18);
+
+  } else if (phase === "label") {
+    // ---- 02 LABEL: roller only ----
+    stateLabel("STATE 02 / LABEL ASSIGNMENT");
+    faceBox("empty");
+    const off = (1 - easeOut(u)) * 7.4 * LABELS.length, base = Math.floor(off), frac = off - base;
+    ctx.save(); ctx.beginPath(); ctx.rect(240, 762, 720, 296); ctx.clip();
+    for (let i = -2; i <= 2; i++) {
+      const yy = 930 + (i - frac) * 98;
+      const idx = (((base + i + CHOSEN) % LABELS.length) + LABELS.length) % LABELS.length;
+      const near = Math.max(0, 1 - Math.abs(i - frac));
+      const sz = fitSize(LABELS[idx], 30 + 16 * near, 680, near > 0.5 ? 500 : 400);
+      text(LABELS[idx], 600, yy + 14, sz, { align: "center", a: 0.16 + 0.74 * near * (0.35 + 0.65 * easeOut(u)), w: near > 0.5 ? 500 : 400 });
+    }
+    ctx.restore();
+    ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 3; ctx.setLineDash([]); ctx.strokeRect(240, 762, 720, 296);
+    rect(240, 880, 720, 1.5, 0.35); rect(240, 978, 720, 1.5, 0.35);
+    text("YOU HAVE BEEN ASSIGNED", 600, 1120, 34, { align: "center", a: 0.8 * easeOut(u) });
+
+  } else if (phase === "materialize") {
+    // ---- 03a: fragments fall in, the neutral outline fades in ----
+    stateLabel("STATE 03 / POSE REVEAL");
+    labelTitle(0.92 * easeOut(clamp(el / 500, 0, 1)));
+    const M = CFG.mat, dk = clamp((el - M.dashIn[0]) / (M.dashIn[1] - M.dashIn[0]), 0, 1), ds = lerp(0.97, 1, easeOut(dk));
+    ctx.save();
+    ctx.translate(FIG_CENTRE.x, FIG_CENTRE.y); ctx.scale(ds, ds); ctx.translate(-FIG_CENTRE.x, -FIG_CENTRE.y);
+    drawOutlines(0, 0, () => CFG.dashA * easeOut(dk));
+    ctx.restore();
+    for (const it of pile) drawItem(it, dropPose(it, el), 0);
+    faceBox("empty");
+
+  } else if (phase === "morph") {
+    // ---- 03b: neutral outline morphs into the target ----
+    stateLabel("STATE 03 / POSE REVEAL");
+    labelTitle(0.92);
+    const mt = easeInOut(u);
+    drawOutlines(mt, mt, () => CFG.dashA);
+    for (const it of pile) drawItem(it, { x: it.pile.x, y: it.pile.y + floatY(it, now), rot: it.pile.rot, sc: it.pile.scale, a: 1 }, 0);
+    faceBox("live", null);
+
+  } else if (phase === "assemble") {
+    // ---- 04: selection lift, then slow arcing flight ----
+    stateLabel("STATE 04 / ALIGNING");
+    labelTitle(0.9);
+    const poses = {}, prog = {};
+    for (const it of pile) {
+      const p = flightPose(it, el);
+      it._pose = p;
+      if (it.isTarget) { poses[it.key] = p; prog[it.key] = easeInOut(p.u); }
+    }
+    drawOutlines(1, 1, (k) => CFG.dashA * (1 - (prog[k] || 0)));
+    for (const it of pile) if (!it.isTarget && !it.fl.fadeOnly && it._pose.u === 0) drawItem(it, it._pose, 0);
+    for (const it of pile) if (!it.isTarget && it.fl.fadeOnly) drawItem(it, it._pose, 0);
+    for (const it of pile) if (!it.isTarget && it._pose.u > 0) drawItem(it, it._pose, 0);
+    for (const it of pile) if (it.isTarget) { drawItem(it, it._pose, 0); strokeShape(it, it._pose, 0.75 * it._pose.sel); }
+    drawParticles(1);
+    const F = CFG.FINAL;
+    const vals = { head: F.head * prog.head, chest: F.chest * prog.torso, abdomen: F.abdomen * prog.torso,
+                   ua: F.ua * prog.lua, fa: F.fa * prog.lfa, th: F.th * prog.rleg, ca: F.ca * prog.lleg };
+    const expr = CFG.exprAssemble * easeOut(clamp((el - (CFG.fly.liftMs + CFG.fly.liftHold)) / (dur - 800), 0, 1));
+    totalBlock(scoreOf(vals, expr), SUB_LIVE);
+    faceBox("live", expr);
+    drawTags(poses, vals, 1, (k) => clamp((prog[k] - 0.72) / 0.28, 0, 1));
+
+  } else if (phase === "colorize" || phase === "annotate" || phase === "hold") {
+    stateLabel("STATE 04 / ALIGNING");
+    labelTitle(0.9);
+    const poses = stillPoses();
+    let colourOf, expr, reflAmt = 1;
+    const vals = Object.assign({}, CFG.FINAL);
+    if (phase === "colorize") {
+      const Cc = CFG.colour, frontStart = figBottom + 200;
+      const front = lerp(frontStart, figTop - 120, easeInOut(clamp((el - Cc.pause) / (dur - Cc.pause), 0, 1)));
+      scanForce = el < Cc.pause ? lerp(scanFrom, frontStart, easeInOut(clamp(el / Cc.pause, 0, 1))) : front;
+      colourOf = (k) => clamp((PIECE[k].centre.y - front) / Cc.band + 0.5, 0, 1);
+      expr = lerp(CFG.exprAssemble, CFG.exprFinal, easeInOut(u));
+      reflAmt = easeOut(clamp((el - Cc.pause) / 900, 0, 1));
+    } else {
+      colourOf = () => 1;
+      expr = CFG.exprFinal + (phase === "hold" ? Math.sin(now / 520) * 1.2 : 0);
+      if (phase === "hold") for (const j of JOINTS) vals[j] += Math.sin(now / 470 + j.length) * 0.5;
+    }
+    drawReflection(poses, colourOf, reflAmt);
+    for (const k of ALL_KEYS) drawItem(REAL[k], poses[k], colourOf(k));
+    drawParticles(1);
+    let total = scoreOf(vals, expr);
+    if (phase === "hold") total = Math.min(CFG.capShown, total + Math.sin(now / 420) * 0.6);
+    totalBlock(total, SUB_LIVE);
+    faceBox("live", expr);
+    drawTags(poses, vals, 1);
+    if (phase !== "colorize") {
+      const da = phase === "annotate" ? easeOut(u) : 1;
+      text(DESCRIPTOR, 600, DESC_Y, 18, { align: "center", a: 0.55 * da, ls: 1.5 });
+    }
+
+  } else if (phase === "decay") {
+    stateLabel("STATE 04 / ALIGNING");
+    labelTitle(0.9);
+    const F = CFG.FINAL, S = CFG.SAG, ku = Math.pow(u, 1.5);
+    const vals = {}; for (const j of JOINTS) vals[j] = F[j] * (1 - ku * S[j]);
+    const expr = CFG.exprFinal * (1 - Math.pow(u, 1.3) * 0.75);
+    const total = scoreOf(vals, expr);
+    const c = colourFromTotal(total);
+    const poses = {};
+    for (const k of ALL_KEYS) poses[k] = decayPose(k, ku * S[JOINT_OF[k]]);
+    drawReflection(poses, () => c, 1);
+    drawOutlines(1, 1, () => 0.34 * easeOut(clamp(u / 0.4, 0, 1)));
+    for (const k of ALL_KEYS) drawItem(REAL[k], poses[k], c);
+    decayEnd = poses;
+    drawParticles(1);
+    totalBlock(total, SUB_LIVE);
+    faceBox("live", expr);
+    drawTags(poses, vals, 1);
+    text(DESCRIPTOR, 600, DESC_Y, 18, { align: "center", a: 0.55 * c, ls: 1.5 });
+    if (total < CFG.collapseBelow) { setPhase("collapse", now); requestAnimationFrame(draw); return; }
+
+  } else if (phase === "collapse") {
+    stateLabel("STATE 05 / COLLAPSE");
+    labelTitle(0.28);
+    const e = easeOut(u), poses = {};
+    for (const k of ALL_KEYS) poses[k] = collapsePose(k, e);
+    drawReflection(poses, () => 0, 1 - clamp(e / 0.4, 0, 1));
+    drawOutlines(1, 1, () => 0.34);
+    for (const k of ALL_KEYS) drawItem(REAL[k], poses[k], 0);
+    drawParticles(1);
+    totalBlock(lerp(29, 12, e), "BELOW 30 THRESHOLD", 0.6);
+    faceBox("blur", 0, 0.7);
+    text("CHALLENGE FAILED", 600, 1748, 56, { align: "center", a: 0.9 * e, w: 500 });
+
+  } else if (phase === "cooldown") {
+    stateLabel("STATE 06 / COOLDOWN");
+    drawOutlines(1, 1, () => 0.34 * (1 - easeOut(u)));
+    for (const k of ALL_KEYS) { const p = collapsePose(k, 1); p.a = lerp(0.4, 0.08, u); drawItem(REAL[k], p, 0); }
+    drawParticles(Math.max(0, 1 - u * 1.6));
+    faceBox("live", null, 0.3);
+    const remain = Math.max(0, Math.ceil((1 - u) * (CFG.T.cooldown / 1000)));
+    const rc = TORSO_C;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = "rgba(255,255,255,.2)"; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.arc(rc.x, rc.y, 130, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,.8)";
+    ctx.beginPath(); ctx.arc(rc.x, rc.y, 130, -Math.PI / 2, -Math.PI / 2 + (1 - u) * Math.PI * 2); ctx.stroke();
+    ctx.restore();
+    text(String(remain), rc.x, rc.y + 48, 140, { align: "center", a: 0.9, w: 500, glow: 0.28, glowR: 24 });
+    text("SEC", rc.x, rc.y + 106, 22, { align: "center", a: 0.45, ls: 4 });
+    text("INTERFACE LOCKED", 600, 1706, 44, { align: "center", a: 0.7, w: 500 });
+    text("RETURNS TO IDLE WHEN THE COUNT ENDS", 600, 1782, 24, { align: "center", a: 0.45 });
+  }
+
+  // machine-vision chrome (reticle + scanline), then film grain
+  {
+    const S = CFG.scan, travel = LH + S.band * 2;
+    const speed = phase === "idle" ? travel / S.idlePeriod : (phase === "cooldown" ? 0 : travel / S.livePeriod);
+    const painting = scanForce !== null;
+    if (painting) scanY = scanForce;
+    else { scanY += speed * dt * 1000; if (scanY > LH + S.band) scanY = -S.band; }
+    const glitchK = phase === "collapse" ? clamp(1 - el / S.glitchMs, 0, 1) : 0;
+    drawChrome(scanY, glitchK, painting);
+    scanForce = null;
+  }
+  if (GRAIN.length) {
+    ctx.save(); ctx.globalAlpha = CFG.filmGrain; ctx.fillStyle = GRAIN[(frame >> 1) % GRAIN.length];
+    ctx.fillRect(0, 0, LW, LH); ctx.restore();
+  }
+
+  if (phase !== "idle" && dur && el >= dur) nextPhase(now);
+  requestAnimationFrame(draw);
+}
+
+/* ---------------------------------------------------------------------
+   12. INPUT + BOOT
+   --------------------------------------------------------------------- */
+function start() {
+  const now = performance.now();
+  if (phase === "idle") setPhase("label", now);
+  else setPhase("idle", now);
+}
+document.getElementById("stage").addEventListener("pointerdown", start);
+window.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); } });
+
+fit();
+buildColourTextures();
+buildGrain();
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fit());
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
