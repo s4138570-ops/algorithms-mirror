@@ -61,8 +61,8 @@ const CFG = {
   // idle button
   button: { cx: 600, cy: 1735, w: 460, h: 110, r: 14, breathe: 2400 },
 
-  // materialize: fragments fall in, dashed outline fades in
-  mat: { dropMs: 700, dropDelay: 900, dropFrom: [500, 1000], backC: 0.9, dashIn: [300, 1100] },
+  // materialize: fragments surface in place (fade + slight rise + scale), dashed outline fades in
+  mat: { fadeMs: 900, fadeDelay: 700, rise: [14, 34], scaleFrom: 0.86, spin: 0.12, dashIn: [300, 1100] },
 
   // flight
   fly: { waveGap: 380, jitter: 140, targetDur: [2600, 3000], decoyDur: [2400, 3000],
@@ -142,7 +142,6 @@ const lerp = (a, b, t) => a + (b - a) * t;
 const rand = (a, b) => a + Math.random() * (b - a);
 const easeOut = (t) => 1 - Math.pow(1 - t, 3);
 const easeInOut = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-const easeOutBack = (t, c1) => { const c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
 const P = (x, y) => ({ x, y });
 const mir = (p) => P(2 * CFG.CX - p.x, p.y);
 const along = (a, b, t) => P(lerp(a.x, b.x, t), lerp(a.y, b.y, t));
@@ -681,12 +680,12 @@ function nextPhase(now) { setPhase(ORDER[(ORDER.indexOf(phase) + 1) % ORDER.leng
 
 function setupDrops() {
   const M = CFG.mat;
-  for (const it of pile) it.drop = { delay: rand(0, M.dropDelay), from: it.pile.y - rand(M.dropFrom[0], M.dropFrom[1]), spin: rand(-0.6, 0.6) };
+  for (const it of pile) it.drop = { delay: rand(0, M.fadeDelay), rise: rand(M.rise[0], M.rise[1]), spin: rand(-M.spin, M.spin) };
 }
 function dropPose(it, el) {
-  const M = CFG.mat, d = it.drop, k = clamp((el - d.delay) / M.dropMs, 0, 1);
-  return { x: it.pile.x, y: lerp(d.from, it.pile.y, easeOutBack(k, M.backC)), rot: it.pile.rot + (1 - k) * d.spin,
-           sc: it.pile.scale, a: clamp(k / 0.25, 0, 1) };
+  const M = CFG.mat, d = it.drop, k = clamp((el - d.delay) / M.fadeMs, 0, 1), e = easeOut(k);
+  return { x: it.pile.x, y: it.pile.y + (1 - e) * d.rise, rot: it.pile.rot + (1 - e) * d.spin,
+           sc: it.pile.scale * lerp(M.scaleFrom, 1, e), a: easeInOut(k) };
 }
 function setupFlights(now) {
   for (const it of pile) {
@@ -826,7 +825,7 @@ function draw(now) {
     text("YOU HAVE BEEN ASSIGNED", 600, 1120, 34, { align: "center", a: 0.8 * easeOut(u) });
 
   } else if (phase === "materialize") {
-    // ---- 03a: fragments fall in, the neutral outline fades in ----
+    // ---- 03a: fragments surface in place, the neutral outline fades in ----
     stateLabel("STATE 03 / POSE REVEAL");
     labelTitle(0.92 * easeOut(clamp(el / 500, 0, 1)));
     const M = CFG.mat, dk = clamp((el - M.dashIn[0]) / (M.dashIn[1] - M.dashIn[0]), 0, 1), ds = lerp(0.97, 1, easeOut(dk));
